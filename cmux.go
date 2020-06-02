@@ -97,6 +97,8 @@ type CMux interface {
 	HandleError(ErrorHandler)
 	// sets a timeout for the read of matchers
 	SetReadTimeout(time.Duration)
+	// Close cmux server and stop listen
+	Close()
 }
 
 type matchersListener struct {
@@ -111,6 +113,7 @@ type cMux struct {
 	donec       chan struct{}
 	sls         []matchersListener
 	readTimeout time.Duration
+	allc        []net.Conn
 }
 
 func matchersToMatchWriters(matchers []Matcher) []MatchWriter {
@@ -146,7 +149,7 @@ func (m *cMux) Serve() error {
 	var wg sync.WaitGroup
 
 	defer func() {
-		close(m.donec)
+		m.closeDoneChan()
 		wg.Wait()
 
 		for _, sl := range m.sls {
@@ -159,6 +162,13 @@ func (m *cMux) Serve() error {
 	}()
 
 	for {
+		select {
+		case <-m.donec:
+			// cmux was closed by Close()
+			return nil
+		default:
+			// pass
+		}
 		c, err := m.root.Accept()
 		if err != nil {
 			if !m.handleErr(err) {
@@ -167,8 +177,44 @@ func (m *cMux) Serve() error {
 			continue
 		}
 
+		select {
+		case <-m.donec:
+			// cmux was closed by Close()
+			return nil
+		default:
+			// pass
+		}
+
 		wg.Add(1)
+		// TODO: 在本系统中，连接有限，所以可以这么干
+		// 本质上这里有泄露，c被正常close时没有从slice中清理
+		m.allc = append(m.allc, c)
 		go m.serve(c, m.donec, &wg)
+	}
+}
+
+func (m *cMux) Close() {
+	m.closeDoneChan()
+	// close all connected connections
+	var wg sync.WaitGroup
+	for _, c := range m.allc {
+		wg.Add(1)
+		go func(c net.Conn) {
+			c.Close()
+			wg.Done()
+		}(c)
+	}
+	wg.Wait()
+	// close Listen
+	m.root.Close()
+}
+
+func (m *cMux) closeDoneChan() {
+	select {
+	case <-m.donec:
+		// already closed
+	default:
+		close(m.donec)
 	}
 }
 
